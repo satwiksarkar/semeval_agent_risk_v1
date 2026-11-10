@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-risk"
+version = "0.1.0"
+description = "SemEval 2027 Task 10 (AgentRisk) - Subtask 1: Multi-turn Trajectory Risk Prediction"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "SemEval AgentRisk Research Team" }
+]
+keywords = [
+    "agent-safety",
+    "graph-neural-networks",
+    "trajectory-dag",
+    "llm",
+    "risk-prediction",
+    "semeval-2027"
+]
+dependencies = [
+    "networkx>=3.0",
+    "pydantic>=2.0",
+    "langgraph>=0.2.0",
+    "torch>=2.0.0",
+    "transformers>=4.40.0",
+    "peft>=0.10.0",
+    "outlines>=0.0.40",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "black>=24.0.0",
+    "ruff>=0.3.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+

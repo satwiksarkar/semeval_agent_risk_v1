@@ -1,0 +1,32 @@
+"""
+agent_risk: Core library for SemEval 2027 Task 10 (AgentRisk) - Subtask 1.
+"""
+
+from agent_risk.dag_parser import (
+    TrajectoryDAG,
+    TOKEN_USER_INTENT_START,
+    TOKEN_USER_INTENT_END,
+    TOKEN_THOUGHT_START,
+    TOKEN_THOUGHT_END,
+    TOKEN_API_CALL_START,
+    TOKEN_API_CALL_END,
+    TOKEN_OBSERVATION_START,
+    TOKEN_OBSERVATION_END,
+    TOKEN_PROPOSED_ACTION_START,
+    TOKEN_PROPOSED_ACTION_END,
+)
+
+__version__ = "0.1.0"
+__all__ = [
+    "TrajectoryDAG",
+    "TOKEN_USER_INTENT_START",
+    "TOKEN_USER_INTENT_END",
+    "TOKEN_THOUGHT_START",
+    "TOKEN_THOUGHT_END",
+    "TOKEN_API_CALL_START",
+    "TOKEN_API_CALL_END",
+    "TOKEN_OBSERVATION_START",
+    "TOKEN_OBSERVATION_END",
+    "TOKEN_PROPOSED_ACTION_START",
+    "TOKEN_PROPOSED_ACTION_END",
+]

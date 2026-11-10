@@ -1,0 +1,50 @@
+{
+  "task": "SemEval 2027 Task 10 (AgentRisk) - Phase 2",
+  "description": "LangGraph Deterministic Tool Hallucination & Risk Modifier Enriched Batches",
+  "splits": {
+    "train": {
+      "total_samples": 568,
+      "total_hallucinations": 4,
+      "hallucination_rate": 0.7,
+      "batches": [
+        {
+          "batch_file": "batch_00000.pt",
+          "num_samples": 568,
+          "hallucinations_detected": 4,
+          "hallucination_rate": 0.7,
+          "avg_risk_modifier": 0.007,
+          "flags_tensor_shape": [
+            568
+          ],
+          "modifiers_tensor_shape": [
+            568
+          ],
+          "elapsed_seconds": 3.457,
+          "memory_mb": 276.5
+        }
+      ]
+    },
+    "dev": {
+      "total_samples": 143,
+      "total_hallucinations": 0,
+      "hallucination_rate": 0.0,
+      "batches": [
+        {
+          "batch_file": "batch_00000.pt",
+          "num_samples": 143,
+          "hallucinations_detected": 0,
+          "hallucination_rate": 0.0,
+          "avg_risk_modifier": 0.0,
+          "flags_tensor_shape": [
+            143
+          ],
+          "modifiers_tensor_shape": [
+            143
+          ],
+          "elapsed_seconds": 0.95,
+          "memory_mb": 274.8
+        }
+      ]
+    }
+  }
+}

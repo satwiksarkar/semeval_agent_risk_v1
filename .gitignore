@@ -1,0 +1,28 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch checkpoints and tensors
+*.pt
+*.pth
+*.bin
+
+# Data directories (raw and processed artifacts)
+data/raw/*
+!data/raw/.gitkeep
+data/processed/phase_1_dag/*
+!data/processed/phase_1_dag/.gitkeep
+
+# Environments & IDEs
+.venv/
+env/
+venv/
+.idea/
+.vscode/
+*.swp
+
+# Distribution / Packaging
+dist/
+build/
+*.egg-info/
