@@ -9,6 +9,7 @@ using Mean Absolute Error (MAE / L1Loss) and physical risk modifier penalties.
 Hardware Optimization for Kaggle 2x T4 GPUs (16GB VRAM each):
 - Micro-batch size of 2 with gradient accumulation steps of 8 (effective batch size: 16).
 - Mixed precision training with torch.autocast (float16) and GradScaler.
+- Automatic multi-GPU sharding (device_map="auto") across 2x T4s and gradient checkpointing.
 - LoRA adapters (r=8, alpha=16) to freeze base LLM weights and save VRAM.
 - Persists best adapter checkpoint to models/lora_adapters/ based on validation MAE.
 """
@@ -61,16 +62,28 @@ class VerifiedTrajectoryDataset(Dataset):
 
         for b_file in batch_files:
             logger.info(f"Loading batch file: {b_file.name}")
-            data = torch.load(b_file)
+            data = torch.load(b_file, weights_only=False)
             num_samples = data.get("num_samples", len(data.get("tokenized_texts", [])))
             for i in range(num_samples):
                 self.samples.append({
                     "id": data["sample_ids"][i] if "sample_ids" in data else f"sample-{i}",
                     "tokenized_text": data["tokenized_texts"][i],
                     "adj_matrix": data["adj_matrices"][i],
-                    "risk_level": float(data["risk_levels"][i].item() if torch.is_tensor(data["risk_levels"][i]) else data["risk_levels"][i]),
-                    "risk_modifier": float(data["risk_modifiers"][i].item() if torch.is_tensor(data["risk_modifiers"][i]) else data["risk_modifiers"][i]),
-                    "hallucination_flag": float(data["hallucination_flags"][i].item() if "hallucination_flags" in data else 0.0),
+                    "risk_level": float(
+                        data["risk_levels"][i].item()
+                        if torch.is_tensor(data["risk_levels"][i])
+                        else data["risk_levels"][i]
+                    ),
+                    "risk_modifier": float(
+                        data["risk_modifiers"][i].item()
+                        if torch.is_tensor(data["risk_modifiers"][i])
+                        else data["risk_modifiers"][i]
+                    ),
+                    "hallucination_flag": float(
+                        data["hallucination_flags"][i].item()
+                        if "hallucination_flags" in data
+                        else 0.0
+                    ),
                 })
 
         logger.info(f"Loaded {len(self.samples)} total trajectories from {data_dir}")
@@ -122,10 +135,11 @@ def train_one_epoch(
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     criterion: nn.Module,
-    device: torch.device,
+    head_device: torch.device,
     grad_accum_steps: int = 8,
     scaler: Optional[torch.amp.GradScaler] = None,
     epoch: int = 1,
+    max_steps: Optional[int] = None,
 ) -> float:
     """
     Executes one training epoch with micro-batching and gradient accumulation.
@@ -135,17 +149,22 @@ def train_one_epoch(
     accumulated_loss = 0.0
     optimizer.zero_grad(set_to_none=True)
     num_batches = len(dataloader)
+    if max_steps is not None:
+        num_batches = min(num_batches, max_steps)
 
-    use_cuda_amp = (device.type == "cuda" and scaler is not None)
+    use_cuda_amp = (head_device.type == "cuda" and scaler is not None)
 
     for step, batch in enumerate(dataloader, start=1):
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        adj_matrices = [adj.to(device) for adj in batch["adj_matrices"]]
-        targets = batch["risk_levels"].to(device)
-        risk_modifiers = batch["risk_modifiers"].to(device)
+        if max_steps is not None and step > max_steps:
+            break
 
-        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_cuda_amp):
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        adj_matrices = batch["adj_matrices"]
+        targets = batch["risk_levels"].to(head_device)
+        risk_modifiers = batch["risk_modifiers"].to(head_device)
+
+        with torch.autocast(device_type=head_device.type, dtype=torch.float16, enabled=use_cuda_amp):
             predictions = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -166,11 +185,15 @@ def train_one_epoch(
         if step % grad_accum_steps == 0 or step == num_batches:
             if use_cuda_amp:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad], max_norm=1.0
+                )
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad], max_norm=1.0
+                )
                 optimizer.step()
 
             optimizer.zero_grad(set_to_none=True)
@@ -190,26 +213,31 @@ def evaluate(
     model: nn.Module,
     dataloader: DataLoader,
     criterion: nn.Module,
-    device: torch.device,
+    head_device: torch.device,
+    max_steps: Optional[int] = None,
 ) -> Tuple[float, List[Dict[str, Any]]]:
     """
     Evaluates model on validation set using Mean Absolute Error (MAE).
     """
     model.eval()
     total_mae = 0.0
+    total_count = 0
     sample_records: List[Dict[str, Any]] = []
 
-    use_cuda_amp = (device.type == "cuda")
+    use_cuda_amp = (head_device.type == "cuda")
 
     with torch.no_grad():
-        for batch in dataloader:
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            adj_matrices = [adj.to(device) for adj in batch["adj_matrices"]]
-            targets = batch["risk_levels"].to(device)
-            risk_modifiers = batch["risk_modifiers"].to(device)
+        for step, batch in enumerate(dataloader, start=1):
+            if max_steps is not None and step > max_steps:
+                break
 
-            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_cuda_amp):
+            input_ids = batch["input_ids"]
+            attention_mask = batch["attention_mask"]
+            adj_matrices = batch["adj_matrices"]
+            targets = batch["risk_levels"].to(head_device)
+            risk_modifiers = batch["risk_modifiers"].to(head_device)
+
+            with torch.autocast(device_type=head_device.type, dtype=torch.float16, enabled=use_cuda_amp):
                 predictions = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -219,6 +247,7 @@ def evaluate(
                 mae_loss = criterion(predictions, targets)
 
             total_mae += mae_loss.item() * len(targets)
+            total_count += len(targets)
 
             preds_np = predictions.detach().cpu().tolist()
             targs_np = targets.detach().cpu().tolist()
@@ -234,7 +263,7 @@ def evaluate(
                     "abs_error": round(abs(preds_np[i] - targs_np[i]), 3),
                 })
 
-    avg_mae = total_mae / max(len(dataloader.dataset), 1)
+    avg_mae = total_mae / max(total_count, 1)
     return avg_mae, sample_records
 
 
@@ -297,20 +326,49 @@ def run_training():
         help="Maximum sequence length for tokenized interaction string.",
     )
     parser.add_argument(
+        "--device_map",
+        type=str,
+        default="auto",
+        help="Accelerate device_map for multi-GPU sharding (e.g. 'auto' on Kaggle 2x T4, or 'none').",
+    )
+    parser.add_argument(
+        "--load_in_4bit",
+        action="store_true",
+        help="Enable 4-bit QLoRA quantization via bitsandbytes to reduce VRAM below 6GB.",
+    )
+    parser.add_argument(
+        "--no_gradient_checkpointing",
+        action="store_true",
+        help="Disable gradient checkpointing (enabled by default to save VRAM).",
+    )
+    parser.add_argument(
+        "--hf_token",
+        type=str,
+        default=os.environ.get("HF_TOKEN"),
+        help="Hugging Face access token (defaults to HF_TOKEN environment variable).",
+    )
+    parser.add_argument(
         "--dry_run",
         action="store_true",
-        help="Runs a rapid dry-run to verify training pass without full epochs.",
+        help="Runs 2 training steps and 2 dev steps to verify pipeline without full epochs.",
     )
 
     args = parser.parse_args()
 
     # Hardware detection
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    logger.info(f"Target Compute Device: {device} (Available GPUs: {num_gpus})")
-    if device.type == "cuda":
+    has_cuda = torch.cuda.is_available()
+    head_device = torch.device("cuda:0" if has_cuda else "cpu")
+    num_gpus = torch.cuda.device_count() if has_cuda else 0
+    logger.info(f"Target Compute Device: {head_device} (Available GPUs: {num_gpus})")
+    if has_cuda:
         for i in range(num_gpus):
-            logger.info(f"  GPU [{i}]: {torch.cuda.get_device_name(i)} (VRAM: {torch.cuda.get_device_properties(i).total_memory / 1024**3:.1f} GB)")
+            logger.info(
+                f"  GPU [{i}]: {torch.cuda.get_device_name(i)} "
+                f"(VRAM: {torch.cuda.get_device_properties(i).total_memory / 1024**3:.1f} GB)"
+            )
+
+    # Determine device_map
+    device_map = None if (not has_cuda or args.device_map.lower() == "none") else args.device_map
 
     # Output directory
     output_dir = Path(args.output_dir)
@@ -319,7 +377,9 @@ def run_training():
     # 1. Initialize Tokenizer
     logger.info(f"Loading Tokenizer for {args.model_name_or_path}...")
     try:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.model_name_or_path, trust_remote_code=True, token=args.hf_token
+        )
     except Exception as e:
         logger.warning(f"Could not load remote tokenizer ({e}); falling back to standard LlamaTokenizerFast.")
         from transformers import LlamaTokenizerFast
@@ -350,8 +410,11 @@ def run_training():
     )
 
     # 3. Instantiate HybridRiskModel
-    logger.info(f"Instantiating HybridRiskModel (LoRA r=8, alpha=16) on {device}...")
-    torch_dtype = torch.float16 if device.type == "cuda" else torch.float32
+    logger.info(
+        f"Instantiating HybridRiskModel (LoRA r=8, alpha=16, device_map={device_map}, "
+        f"4bit={args.load_in_4bit})..."
+    )
+    torch_dtype = torch.float16 if has_cuda else torch.float32
 
     model = HybridRiskModel(
         model_name_or_path=args.model_name_or_path,
@@ -363,7 +426,18 @@ def run_training():
         lora_dropout=0.05,
         torch_dtype=torch_dtype,
         load_pretrained=True,
-    ).to(device)
+        device_map=device_map,
+        load_in_4bit=args.load_in_4bit,
+        gradient_checkpointing=not args.no_gradient_checkpointing,
+        hf_token=args.hf_token,
+    )
+
+    # If LLM is sharded via device_map, only move GCN & regression head to cuda:0
+    if device_map is not None:
+        model.gcn.to(head_device)
+        model.regression_head.to(head_device)
+    else:
+        model.to(head_device)
 
     # Count trainable parameters
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -379,7 +453,7 @@ def run_training():
         lr=args.lr,
         weight_decay=0.01,
     )
-    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
+    scaler = torch.amp.GradScaler("cuda") if has_cuda else None
     criterion = nn.L1Loss()  # Evaluated using Mean Absolute Error (MAE)
 
     best_val_mae = float("inf")
@@ -391,11 +465,13 @@ def run_training():
         "micro_batch_size": args.micro_batch_size,
         "grad_accum_steps": args.grad_accum_steps,
         "effective_batch_size": args.micro_batch_size * args.grad_accum_steps,
-        "device": str(device),
+        "device_map": str(device_map),
+        "load_in_4bit": args.load_in_4bit,
         "history": [],
     }
 
     total_epochs = 1 if args.dry_run else args.epochs
+    max_steps = 2 if args.dry_run else None
     logger.info(f"Starting Training for {total_epochs} epoch(s)...")
 
     for epoch in range(1, total_epochs + 1):
@@ -406,17 +482,19 @@ def run_training():
             dataloader=train_loader,
             optimizer=optimizer,
             criterion=criterion,
-            device=device,
+            head_device=head_device,
             grad_accum_steps=args.grad_accum_steps,
             scaler=scaler,
             epoch=epoch,
+            max_steps=max_steps,
         )
 
         val_mae, val_records = evaluate(
             model=model,
             dataloader=dev_loader,
             criterion=criterion,
-            device=device,
+            head_device=head_device,
+            max_steps=max_steps,
         )
 
         epoch_time = time.time() - epoch_start
@@ -442,7 +520,7 @@ def run_training():
 
         # Clear memory between epochs
         gc.collect()
-        if device.type == "cuda":
+        if has_cuda:
             torch.cuda.empty_cache()
 
     training_manifest["best_val_mae"] = round(best_val_mae, 4)
@@ -460,4 +538,3 @@ def run_training():
 
 if __name__ == "__main__":
     run_training()
-

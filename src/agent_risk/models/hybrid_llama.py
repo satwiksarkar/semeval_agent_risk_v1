@@ -5,6 +5,7 @@ topological GCN DAG structural embeddings for multi-turn agent risk estimation.
 
 SemEval 2027 Task 10 (AgentRisk) - Phase 3
 Applies PEFT/LoRA (rank 8, alpha 16) to freeze base LLM weights for Kaggle 2x T4 GPU constraints.
+Supports multi-GPU sharding (device_map="auto"), 4-bit QLoRA, and gradient checkpointing.
 """
 
 from pathlib import Path
@@ -12,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from transformers import AutoModel, AutoConfig, PretrainedConfig
-from peft import LoraConfig, get_peft_model, TaskType
+from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
 
 from agent_risk.models.gnn_encoder import VanillaGCN
 
@@ -40,10 +41,15 @@ class HybridRiskModel(nn.Module):
         target_modules: Optional[List[str]] = None,
         torch_dtype: torch.dtype = torch.float16,
         load_pretrained: bool = True,
+        device_map: Optional[Union[str, Dict[str, Any]]] = None,
+        load_in_4bit: bool = False,
+        gradient_checkpointing: bool = False,
+        hf_token: Optional[str] = None,
     ):
         super().__init__()
         self.model_name_or_path = model_name_or_path
         self.gnn_out_features = gnn_out_features
+        self.is_sharded = device_map is not None
 
         if target_modules is None:
             target_modules = ["q_proj", "v_proj"]
@@ -56,17 +62,44 @@ class HybridRiskModel(nn.Module):
             raw_llm = AutoModel.from_config(config)
             llm_hidden_size = config.hidden_size
         elif load_pretrained:
-            raw_llm = AutoModel.from_pretrained(
-                model_name_or_path,
-                torch_dtype=torch_dtype,
-                low_cpu_mem_usage=True,
-                trust_remote_code=True,
-            )
+            load_kwargs: Dict[str, Any] = {
+                "torch_dtype": torch_dtype,
+                "low_cpu_mem_usage": True,
+                "trust_remote_code": True,
+            }
+            if device_map is not None:
+                load_kwargs["device_map"] = device_map
+            if hf_token is not None:
+                load_kwargs["token"] = hf_token
+
+            if load_in_4bit:
+                from transformers import BitsAndBytesConfig
+                load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch_dtype,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                )
+
+            raw_llm = AutoModel.from_pretrained(model_name_or_path, **load_kwargs)
             llm_hidden_size = raw_llm.config.hidden_size
+
+            if load_in_4bit:
+                raw_llm = prepare_model_for_kbit_training(
+                    raw_llm, use_gradient_checkpointing=gradient_checkpointing
+                )
         else:
-            conf = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
+            conf = AutoConfig.from_pretrained(
+                model_name_or_path, trust_remote_code=True, token=hf_token
+            )
             raw_llm = AutoModel.from_config(conf)
             llm_hidden_size = conf.hidden_size
+
+        if gradient_checkpointing and not load_in_4bit:
+            if hasattr(raw_llm, "gradient_checkpointing_enable"):
+                raw_llm.gradient_checkpointing_enable()
+            if hasattr(raw_llm, "enable_input_require_grads"):
+                raw_llm.enable_input_require_grads()
 
         self.llm_hidden_size = llm_hidden_size
 
@@ -80,6 +113,11 @@ class HybridRiskModel(nn.Module):
             task_type=TaskType.FEATURE_EXTRACTION,
         )
         self.llm = get_peft_model(raw_llm, lora_config)
+
+        # Keep LoRA trainable weights in float32 for AMP GradScaler stability
+        for param in self.llm.parameters():
+            if param.requires_grad and param.dtype != torch.float32:
+                param.data = param.data.float()
 
         # 3. Vanilla GCN for Graph Topological Encoding
         self.gcn = VanillaGCN(
@@ -118,16 +156,33 @@ class HybridRiskModel(nn.Module):
         Returns:
             Scalar predictions (B,) on the 1-5 ordinal scale.
         """
+        # Align input_ids with the LLM's input embedding device (essential when device_map="auto")
+        llm_input_device = self.llm.get_input_embeddings().weight.device
+        input_ids = input_ids.to(llm_input_device)
+        attention_mask = attention_mask.to(llm_input_device)
+
         # A. Llama 3 forward pass: extract CLS token embedding
-        llm_outputs = self.llm(input_ids=input_ids, attention_mask=attention_mask)
+        llm_outputs = self.llm(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+        )
         # Using index 0 as the sequence start / CLS representation
         h_text = llm_outputs.last_hidden_state[:, 0, :]  # Shape: (B, llm_hidden_size)
 
         # B. GCN forward pass: extract graph structural embedding
-        h_graph = self.gcn(adj_matrices)  # Shape: (B, gnn_out_features)
+        gcn_device = next(self.gcn.parameters()).device
+        if isinstance(adj_matrices, list):
+            adj_on_dev = [adj.to(gcn_device) for adj in adj_matrices]
+        else:
+            adj_on_dev = adj_matrices.to(gcn_device)
+        h_graph = self.gcn(adj_on_dev)  # Shape: (B, gnn_out_features)
 
-        # Ensure matching device and dtype for fusion
-        h_graph = h_graph.to(device=h_text.device, dtype=h_text.dtype)
+        # Move both embeddings to the regression head's device and dtype
+        head_param = next(self.regression_head.parameters())
+        head_device = head_param.device
+        h_text = h_text.to(device=head_device, dtype=torch.float32)
+        h_graph = h_graph.to(device=head_device, dtype=torch.float32)
 
         # C. Fusion: concatenate text and graph embeddings
         fused_features = torch.cat([h_text, h_graph], dim=-1)  # Shape: (B, fusion_dim)
@@ -137,7 +192,7 @@ class HybridRiskModel(nn.Module):
 
         # E. Physical penalty: add deterministic Phase 2 risk modifier directly
         if risk_modifiers is not None:
-            modifiers = risk_modifiers.to(device=base_risk_score.device, dtype=base_risk_score.dtype).view(-1)
+            modifiers = risk_modifiers.to(device=head_device, dtype=base_risk_score.dtype).view(-1)
             final_risk_score = base_risk_score + modifiers
         else:
             final_risk_score = base_risk_score
