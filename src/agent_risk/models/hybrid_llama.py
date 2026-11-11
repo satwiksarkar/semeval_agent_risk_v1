@@ -21,7 +21,7 @@ from agent_risk.models.gnn_encoder import VanillaGCN
 class HybridRiskModel(nn.Module):
     """
     Parallel hybrid architecture:
-    1. Llama 3 processes structurally tokenized text sequence -> CLS embedding.
+    1. Llama 3 processes structurally tokenized text sequence -> last non-padding token embedding.
     2. VanillaGCN processes the topological adjacency matrix -> Graph embedding.
     3. Fused representation [h_text; h_graph] passes through a regression head.
     4. Phase 2 deterministic risk_modifier is physically added to penalize tool hallucinations.
@@ -161,14 +161,27 @@ class HybridRiskModel(nn.Module):
         input_ids = input_ids.to(llm_input_device)
         attention_mask = attention_mask.to(llm_input_device)
 
-        # A. Llama 3 forward pass: extract CLS token embedding
+        # A. Llama 3 forward pass: extract last non-padding token embedding
+        # Note: Causal LMs (Llama 3) only attend leftward, so index 0 cannot see
+        # downstream trajectory tokens. Pooling the last valid token encodes the
+        # full sequence through <|proposed_action|> regardless of padding side.
         llm_outputs = self.llm(
             input_ids=input_ids,
             attention_mask=attention_mask,
             use_cache=False,
         )
-        # Using index 0 as the sequence start / CLS representation
-        h_text = llm_outputs.last_hidden_state[:, 0, :]  # Shape: (B, llm_hidden_size)
+        hidden_states = llm_outputs.last_hidden_state  # Shape: (B, SeqLen, llm_hidden_size)
+        batch_size, seq_len = input_ids.shape
+        positions = (
+            torch.arange(seq_len, device=attention_mask.device)
+            .unsqueeze(0)
+            .expand(batch_size, -1)
+        )
+        last_token_indices = (positions * (attention_mask > 0).long()).max(dim=1).values
+        batch_indices = torch.arange(batch_size, device=hidden_states.device)
+        h_text = hidden_states[
+            batch_indices, last_token_indices.to(hidden_states.device)
+        ]  # Shape: (B, llm_hidden_size)
 
         # B. GCN forward pass: extract graph structural embedding
         gcn_device = next(self.gcn.parameters()).device

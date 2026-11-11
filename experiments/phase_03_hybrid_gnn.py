@@ -101,8 +101,9 @@ class HybridCollateFn:
     and packages adjacency matrices and risk modifier tensors.
     """
 
-    def __init__(self, tokenizer: PreTrainedTokenizer, max_seq_len: int = 512):
+    def __init__(self, tokenizer: PreTrainedTokenizer, max_seq_len: int = 1024):
         self.tokenizer = tokenizer
+        self.tokenizer.truncation_side = "left"
         self.max_seq_len = max_seq_len
 
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -322,8 +323,8 @@ def run_training():
     parser.add_argument(
         "--max_seq_len",
         type=int,
-        default=512,
-        help="Maximum sequence length for tokenized interaction string.",
+        default=1024,
+        help="Maximum sequence length for tokenized interaction string (default: 1024).",
     )
     parser.add_argument(
         "--device_map",
@@ -387,6 +388,7 @@ def run_training():
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token or tokenizer.bos_token or "<|pad|>"
+    tokenizer.truncation_side = "left"
 
     # 2. Build Datasets and DataLoaders
     train_dataset = VerifiedTrajectoryDataset(Path(args.train_data_dir))
