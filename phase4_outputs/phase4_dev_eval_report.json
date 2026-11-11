@@ -1,0 +1,71 @@
+{
+  "num_samples": 143,
+  "continuous_mae": 0.3966,
+  "integer_mae": 0.3427,
+  "exact_match_accuracy_pct": 68.53,
+  "within_1_accuracy_pct": 97.2,
+  "per_class_metrics": {
+    "1": {
+      "count": 66,
+      "int_mae": 0.0303,
+      "exact_acc_pct": 96.97
+    },
+    "2": {
+      "count": 8,
+      "int_mae": 0.75,
+      "exact_acc_pct": 37.5
+    },
+    "3": {
+      "count": 32,
+      "int_mae": 0.9062,
+      "exact_acc_pct": 18.75
+    },
+    "4": {
+      "count": 35,
+      "int_mae": 0.3429,
+      "exact_acc_pct": 65.71
+    },
+    "5": {
+      "count": 2,
+      "int_mae": 0.0,
+      "exact_acc_pct": 100.0
+    }
+  },
+  "confusion_matrix_1_to_5": [
+    [
+      64,
+      2,
+      0,
+      0,
+      0
+    ],
+    [
+      4,
+      3,
+      0,
+      1,
+      0
+    ],
+    [
+      0,
+      1,
+      6,
+      22,
+      3
+    ],
+    [
+      0,
+      0,
+      7,
+      23,
+      5
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      2
+    ]
+  ]
+}
