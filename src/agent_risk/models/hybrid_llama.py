@@ -13,7 +13,13 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from transformers import AutoModel, AutoConfig, PretrainedConfig
-from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
+from peft import (
+    LoraConfig,
+    PeftModel,
+    get_peft_model,
+    TaskType,
+    prepare_model_for_kbit_training,
+)
 
 from agent_risk.models.gnn_encoder import VanillaGCN
 
@@ -45,6 +51,7 @@ class HybridRiskModel(nn.Module):
         load_in_4bit: bool = False,
         gradient_checkpointing: bool = False,
         hf_token: Optional[str] = None,
+        adapter_dir: Optional[Union[str, Path]] = None,
     ):
         super().__init__()
         self.model_name_or_path = model_name_or_path
@@ -84,7 +91,7 @@ class HybridRiskModel(nn.Module):
             raw_llm = AutoModel.from_pretrained(model_name_or_path, **load_kwargs)
             llm_hidden_size = raw_llm.config.hidden_size
 
-            if load_in_4bit:
+            if load_in_4bit and adapter_dir is None:
                 raw_llm = prepare_model_for_kbit_training(
                     raw_llm, use_gradient_checkpointing=gradient_checkpointing
                 )
@@ -95,7 +102,7 @@ class HybridRiskModel(nn.Module):
             raw_llm = AutoModel.from_config(conf)
             llm_hidden_size = conf.hidden_size
 
-        if gradient_checkpointing and not load_in_4bit:
+        if gradient_checkpointing and not load_in_4bit and adapter_dir is None:
             if hasattr(raw_llm, "gradient_checkpointing_enable"):
                 raw_llm.gradient_checkpointing_enable()
             if hasattr(raw_llm, "enable_input_require_grads"):
@@ -103,21 +110,24 @@ class HybridRiskModel(nn.Module):
 
         self.llm_hidden_size = llm_hidden_size
 
-        # 2. Apply PEFT LoRA (rank 8, alpha 16) to freeze base weights and minimize VRAM
-        lora_config = LoraConfig(
-            r=lora_r,
-            lora_alpha=lora_alpha,
-            target_modules=target_modules,
-            lora_dropout=lora_dropout,
-            bias="none",
-            task_type=TaskType.FEATURE_EXTRACTION,
-        )
-        self.llm = get_peft_model(raw_llm, lora_config)
+        # 2. Apply or Load PEFT LoRA (rank 8, alpha 16)
+        if adapter_dir is not None:
+            self.llm = PeftModel.from_pretrained(raw_llm, str(adapter_dir), is_trainable=False)
+        else:
+            lora_config = LoraConfig(
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                target_modules=target_modules,
+                lora_dropout=lora_dropout,
+                bias="none",
+                task_type=TaskType.FEATURE_EXTRACTION,
+            )
+            self.llm = get_peft_model(raw_llm, lora_config)
 
-        # Keep LoRA trainable weights in float32 for AMP GradScaler stability
-        for param in self.llm.parameters():
-            if param.requires_grad and param.dtype != torch.float32:
-                param.data = param.data.float()
+            # Keep LoRA trainable weights in float32 for AMP GradScaler stability
+            for param in self.llm.parameters():
+                if param.requires_grad and param.dtype != torch.float32:
+                    param.data = param.data.float()
 
         # 3. Vanilla GCN for Graph Topological Encoding
         self.gcn = VanillaGCN(
@@ -136,6 +146,14 @@ class HybridRiskModel(nn.Module):
             nn.SiLU(),
             nn.Linear(64, 1),
         )
+
+        # Load trained GCN & regression head weights if loading from adapters
+        if adapter_dir is not None:
+            fusion_path = Path(adapter_dir) / "fusion_heads.pt"
+            if fusion_path.exists():
+                fusion_state = torch.load(fusion_path, map_location="cpu", weights_only=False)
+                self.gcn.load_state_dict(fusion_state["gcn"])
+                self.regression_head.load_state_dict(fusion_state["regression_head"])
 
     def forward(
         self,
@@ -228,7 +246,53 @@ class HybridRiskModel(nn.Module):
             "gcn": self.gcn.state_dict(),
             "regression_head": self.regression_head.state_dict(),
             "llm_hidden_size": self.llm_hidden_size,
+            "gnn_in_features": self.gcn.in_features,
+            "gnn_hidden_dim": self.gcn.hidden_dim,
             "gnn_out_features": self.gnn_out_features,
             "model_name_or_path": self.model_name_or_path,
         }
         torch.save(fusion_state, save_dir / "fusion_heads.pt")
+
+    @classmethod
+    def from_adapters(
+        cls,
+        adapter_dir: Union[str, Path],
+        base_model: Optional[nn.Module] = None,
+        config: Optional[PretrainedConfig] = None,
+        torch_dtype: torch.dtype = torch.float16,
+        device_map: Optional[Union[str, Dict[str, Any]]] = None,
+        load_in_4bit: bool = False,
+        hf_token: Optional[str] = None,
+    ) -> "HybridRiskModel":
+        """
+        Reconstructs a trained HybridRiskModel from saved LoRA adapters and fusion_heads.pt.
+        """
+        adapter_path = Path(adapter_dir)
+        fusion_path = adapter_path / "fusion_heads.pt"
+        if not fusion_path.exists():
+            raise FileNotFoundError(f"Missing fusion_heads.pt in {adapter_path}")
+
+        fusion_state = torch.load(fusion_path, map_location="cpu", weights_only=False)
+        model_name = fusion_state.get("model_name_or_path", "meta-llama/Meta-Llama-3-8B")
+        gnn_out = int(fusion_state.get("gnn_out_features", 128))
+        gc1_weight = fusion_state["gcn"]["gc1.linear.weight"]
+        gnn_hidden = int(fusion_state.get("gnn_hidden_dim", gc1_weight.shape[0]))
+        gnn_in = int(fusion_state.get("gnn_in_features", gc1_weight.shape[1]))
+
+        instance = cls(
+            model_name_or_path=model_name,
+            base_model=base_model,
+            config=config,
+            gnn_in_features=gnn_in,
+            gnn_hidden_dim=gnn_hidden,
+            gnn_out_features=gnn_out,
+            torch_dtype=torch_dtype,
+            load_pretrained=(base_model is None and config is None),
+            device_map=device_map,
+            load_in_4bit=load_in_4bit,
+            gradient_checkpointing=False,
+            hf_token=hf_token,
+            adapter_dir=adapter_path,
+        )
+        instance.eval()
+        return instance

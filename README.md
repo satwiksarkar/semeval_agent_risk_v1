@@ -68,19 +68,22 @@ semeval_agent_risk_v1/
 │       │   ├── __init__.py
 │       │   ├── state.py               # SimulationState TypedDict
 │       │   └── verifier_nodes.py      # verify_trajectory: heuristic rules & risk modifiers
-│       └── models/                    # Phase 3: PyTorch architectures
+│       └── models/                    # Phase 3 & 4: PyTorch architectures & constrained decoding
 │           ├── __init__.py
 │           ├── gnn_encoder.py         # VanillaGCN: 2-layer graph conv without PyG
-│           └── hybrid_llama.py        # HybridRiskModel: Llama 3 + LoRA + GCN + Regression Head
+│           ├── hybrid_llama.py        # HybridRiskModel: Llama 3 + LoRA + GCN + Regression Head
+│           └── constrained_decoder.py # ConstrainedRiskDecoder: Outlines [1-5] integer enforcer
 ├── experiments/
 │   ├── __init__.py
 │   ├── phase_01_preprocessing.py      # Phase 1 DAG batch processor (1,000 graphs/batch)
 │   ├── phase_02_langgraph.py          # Phase 2 LangGraph batch verifier & feature enricher
-│   └── phase_03_hybrid_gnn.py         # Phase 3 Kaggle-optimized training loop
+│   ├── phase_03_hybrid_gnn.py         # Phase 3 Kaggle-optimized training loop
+│   └── phase_04_inference.py          # Phase 4 Outlines inference, evaluation & submission
 └── tests/
     ├── __init__.py
     ├── test_dag_parser.py             # Validation suite for DAG parsing and pruning logic
-    └── test_hybrid_model.py           # Unit tests for VanillaGCN & HybridRiskModel
+    ├── test_hybrid_model.py           # Unit tests for VanillaGCN & HybridRiskModel
+    └── test_phase4_decoder.py         # Tests for adapter reload & Outlines constrained decoding
 ```
 
 ---
@@ -106,11 +109,36 @@ python experiments/phase_03_hybrid_gnn.py \
     --train_data_dir "data/processed/phase_2_verified/train" \
     --dev_data_dir "data/processed/phase_2_verified/dev" \
     --output_dir "models/lora_adapters" \
+    --device_map "auto" \
+    --load_in_4bit \
     --epochs 5 \
     --micro_batch_size 2 \
     --grad_accum_steps 8 \
+    --max_seq_len 1024 \
     --lr 2e-4
 ```
 - **VRAM Optimization**: Uses mixed precision (`torch.autocast` in fp16), micro-batch size of 2, and 8 gradient accumulation steps (effective batch size: 16).
 - **Physical Penalty**: `final_pred = regression_head(cat(h_text, h_graph)) + risk_modifier`.
 - **Checkpointing**: Evaluates using Mean Absolute Error (`nn.L1Loss()`) and saves the best model adapters to `models/lora_adapters/`.
+
+### 4. Phase 4: Constrained Decoding (`outlines`) & Evaluation
+- **Evaluate on `dev` (computes Continuous MAE, Strict `1–5` Integer MAE, Exact Accuracy %, Within-1 %, and 5x5 Confusion Matrix):**
+  ```bash
+  python experiments/phase_04_inference.py \
+      --mode eval \
+      --adapter_dir "models/lora_adapters" \
+      --data_path "data/processed/phase_2_verified/dev" \
+      --output_dir "outputs" \
+      --device_map "auto" \
+      --load_in_4bit
+  ```
+- **End-to-End 4-Phase Prediction on Raw Test JSONL (generates `submission.csv` & `predictions.jsonl`):**
+  ```bash
+  python experiments/phase_04_inference.py \
+      --mode predict \
+      --adapter_dir "models/lora_adapters" \
+      --data_path "data/raw/test.jsonl" \
+      --output_dir "outputs" \
+      --device_map "auto" \
+      --load_in_4bit
+  ```
