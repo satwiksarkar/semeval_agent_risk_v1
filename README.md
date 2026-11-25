@@ -132,6 +132,7 @@ python experiments/phase_03_hybrid_gnn.py \
       --device_map "auto" \
       --load_in_4bit
   ```
+
 - **End-to-End 4-Phase Prediction on Raw Test JSONL (generates `submission.csv` & `predictions.jsonl`):**
   ```bash
   python experiments/phase_04_inference.py \
@@ -142,3 +143,10 @@ python experiments/phase_03_hybrid_gnn.py \
       --device_map "auto" \
       --load_in_4bit
   ```
+
+---
+
+## License
+
+This project is licensed under the terms of the MIT License as specified in [pyproject.toml](file:///c:/Semeval_developments/semeval_agent_risk_v1/pyproject.toml).
+
